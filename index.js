@@ -75,7 +75,8 @@ async function startBot() {
                 text = msg.message.conversation;
             } else if (messageType.includes('extendedTextMessage')) {
                 text = msg.message.extendedTextMessage.text;
-            } else if (msg.message[messageType[0]]?.caption) {
+            } else if (msg.message[messageType[0]] && msg.message[messageType[0]].caption) {
+
                 text = msg.message[messageType[0]].caption;
             }
 
