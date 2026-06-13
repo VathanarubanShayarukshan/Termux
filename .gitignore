@@ -1,0 +1,4 @@
+auth_info.json
+temp/*
+node_modules
+test.js
