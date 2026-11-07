@@ -13,7 +13,7 @@ const ALLOW_GROUPS = false;            // Set false to ignore group chats
 // -------------------------------------------------------------
 
 const { default: makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, downloadMediaMessage, jidNormalizedUser } = require('@whiskeysockets/baileys');
-const { exec } = require('child_process');
+const { exec, spawn } = require('child_process');
 const readline = require('readline');
 const pino = require('pino');
 const fs = require('fs');
@@ -144,36 +144,147 @@ async function startBot() {
         }
     };
 
-    const sendFileToUser = async (from, currentSession, filePath) => {
-        const fullPath = path.isAbsolute(filePath) ? filePath : path.join(currentSession.cwd, filePath);
-        if (fs.existsSync(fullPath)) {
-            try {
-                const stats = fs.statSync(fullPath);
-                if (stats.isDirectory()) {
-                    await sendMessageSafe(from, { text: `❌ \`${fullPath}\` is a directory. Please specify a file.` });
-                    return;
-                }
-                const sizeMb = (stats.size / (1024 * 1024)).toFixed(2);
-                await sendMessageSafe(from, { text: `📁 *SEND MODE:* Uploading \`${path.basename(fullPath)}\` (${sizeMb} MB)...` });
-
-                let mimeType = 'application/octet-stream';
-                if (fullPath.endsWith('.apk')) mimeType = 'application/vnd.android.package-archive';
-                else if (fullPath.endsWith('.pdf')) mimeType = 'application/pdf';
-                else if (fullPath.endsWith('.zip')) mimeType = 'application/zip';
-                else if (fullPath.endsWith('.mp4')) mimeType = 'video/mp4';
-                else if (fullPath.endsWith('.png')) mimeType = 'image/png';
-                else if (fullPath.endsWith('.jpg') || fullPath.endsWith('.jpeg')) mimeType = 'image/jpeg';
-
-                await sendMessageSafe(from, {
-                    document: { url: fullPath },
-                    fileName: path.basename(fullPath),
-                    mimetype: mimeType
-                });
-            } catch (e) {
-                await sendMessageSafe(from, { text: `❌ *Send Failed:* ${e.message}` });
+    // --- Reliable large-file upload for Baileys v5/v6 (bypasses broken
+    // media-url fetching when the message object has no top-level msgId) ---
+    const withMsgId = (content, msgId) => {
+        const keys = ['image', 'video', 'document', 'audio'];
+        const out = { ...content };
+        for (const k of keys) {
+            if (out[k] && typeof out[k] === 'object' && !out[k].msgId) {
+                out[k] = { ...out[k], msgId };
             }
-        } else {
+        }
+        return out;
+    };
+
+    const uploadMediaRaw = (bufferOrStream, medType, opts = {}) => new Promise((resolve, reject) => {
+        try {
+            const enc = sock.signal?.keys?.get?.(sock.user?.id);
+            const upload = sock.getMediaMessageID || sock.uploadMediaMessageID;
+            if (typeof upload !== 'function') throw new Error('No media upload API in this Baileys version');
+            resolve(Promise.resolve(upload.call(sock, medType, bufferOrStream, { enc, ...opts })));
+        } catch (e) { reject(e); }
+    });
+
+    const readFileBufferSafe = async (filePath) => {
+        try {
+            return await fs.promises.readFile(filePath);
+        } catch (e) {
+            if (e.code === 'EMOJI_RANGE' || (e.message || '').includes('emoji range')) {
+                return await fs.promises.readFile(path.normalize('\\\\?\\' + filePath));
+            }
+            throw e;
+        }
+    };
+
+    const mimeFromExt = (p) => {
+        const ext = path.extname(p).toLowerCase();
+        if (ext === '.mp4') return 'video/mp4';
+        if (ext === '.mkv') return 'video/x-matroska';
+        if (ext === '.webm') return 'video/webm';
+        if (ext === '.mov') return 'video/quicktime';
+        if (ext === '.mp3') return 'audio/mpeg';
+        if (ext === '.ogg' || ext === '.oga') return 'audio/ogg';
+        if (ext === '.wav') return 'audio/wav';
+        if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg';
+        if (ext === '.png') return 'image/png';
+        if (ext === '.webp') return 'image/webp';
+        if (ext === '.gif') return 'image/gif';
+        if (ext === '.pdf') return 'application/pdf';
+        if (ext === '.zip') return 'application/zip';
+        if (ext === '.apk') return 'application/vnd.android.package-archive';
+        return 'application/octet-stream';
+    };
+
+    // Send any local file as a WhatsApp DOCUMENT (works for big files too):
+    // manual encryption upload -> direct msg-id reference -> retry w/ buffer.
+    const sendDocumentReliable = async (from, currentSession, filePath, caption = '') => {
+        const fullPath = path.isAbsolute(filePath) ? filePath : path.join(currentSession.cwd, filePath);
+        if (!fs.existsSync(fullPath)) {
             await sendMessageSafe(from, { text: `❌ *File Not Found:* \`${fullPath}\`` });
+            return false;
+        }
+        const stats = fs.statSync(fullPath);
+        if (stats.isDirectory()) {
+            await sendMessageSafe(from, { text: `❌ \`${fullPath}\` is a directory. Please specify a file.` });
+            return false;
+        }
+        const sizeMb = (stats.size / (1024 * 1024)).toFixed(2);
+        const fileName = path.basename(fullPath);
+        const mimetype = mimeFromExt(fullPath);
+        const taskId = Date.now();
+        const taskObj = { id: taskId, name: `${fileName} (upload)`, progress: 5, statusMsg: `Uploading ${sizeMb} MB...`, process: null, wasKilled: false, mode: 'send' };
+        currentSession.tasks.push(taskObj);
+        await sendMessageSafe(from, { text: `📁 *SEND MODE:* Uploading \`${fileName}\` (${sizeMb} MB)... This runs in background — check \`.pro\` anytime.` });
+
+        const markDone = () => { currentSession.tasks = currentSession.tasks.filter(t => t.id !== taskId); };
+        const buildDocContent = (msgId) => {
+            const c = {
+                document: { url: fullPath, fileLength: stats.size, [Symbol.for('baileys-msg-updated-id')]: msgId },
+                mimetype,
+                fileName
+            };
+            if (caption) c.caption = caption;
+            return c;
+        };
+
+        try {
+            const msgId = await uploadMediaRaw(fullPath, 'document', { extract: false });
+            markDone();
+            if (taskObj.wasKilled) return false;
+            const res = await sock.sendMessage(from, buildDocContent(msgId));
+            if (res && res.key && res.key.id) botMessageIds.add(res.key.id);
+            return true;
+        } catch (e1) {
+            console.error('[DocUpload-1]', e1.message);
+            try {
+                taskObj.statusMsg = 'Retry: reading file into memory...';
+                const buf = await readFileBufferSafe(fullPath);
+                const msgId = await uploadMediaRaw(buf, 'document', { extract: false });
+                markDone();
+                if (taskObj.wasKilled) return false;
+                const res = await sock.sendMessage(from, buildDocContent(msgId));
+                if (res && res.key && res.key.id) botMessageIds.add(res.key.id);
+                return true;
+            } catch (e2) {
+                console.error('[DocUpload-2]', e2.message);
+                markDone();
+                await sendMessageSafe(from, { text: `❌ *Send Failed:* ${e2.message}` });
+                return false;
+            }
+        }
+    };
+
+    const sendFileToUser = async (from, currentSession, filePath, caption = '') => {
+        return await sendDocumentReliable(from, currentSession, filePath, caption);
+    };
+
+    // Native video send with reliable upload fallback (used by VIDEO MODE)
+    const sendVideoReliable = async (from, filePath, caption = '') => {
+        const stats = fs.statSync(filePath);
+        const mimetype = mimeFromExt(filePath);
+        const build = (msgId) => ({
+            video: { url: filePath, fileLength: stats.size, [Symbol.for('baileys-msg-updated-id')]: msgId },
+            mimetype,
+            caption
+        });
+        try {
+            const msgId = await uploadMediaRaw(filePath, 'video', { extract: false });
+            const res = await sock.sendMessage(from, build(msgId));
+            if (res && res.key && res.key.id) botMessageIds.add(res.key.id);
+            return true;
+        } catch (e1) {
+            console.error('[VideoUpload-1]', e1.message);
+            try {
+                const buf = await readFileBufferSafe(filePath);
+                const msgId = await uploadMediaRaw(buf, 'video', { extract: false });
+                const res = await sock.sendMessage(from, build(msgId));
+                if (res && res.key && res.key.id) botMessageIds.add(res.key.id);
+                return true;
+            } catch (e2) {
+                console.error('[VideoUpload-2]', e2.message);
+                return false;
+            }
         }
     };
 
