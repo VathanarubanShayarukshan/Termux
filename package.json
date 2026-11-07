@@ -9,6 +9,7 @@
     "axios": "^0.21.1",
     "fluent-ffmpeg": "^2.1.2",
     "image-q": "^4.0.0",
-    "streamifier": "^0.1.1"
+    "streamifier": "^0.1.1",
+    "ytdl-core": "^4.11.5"
   }
 }

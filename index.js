@@ -27,6 +27,18 @@ const botMessageIds = new Set();
 
 const AGENTIC_BASE_URL = process.env.AGENTIC_URL || 'http://127.0.0.1:8000';
 const AGENTIC_PASS = process.env.AGENTIC_PASSWORD || 'test-pass';
+
+// -------------------------------------------------------------
+// VIDEO MODE CONFIG (YouTube Downloader - replica of
+// https://github.com/DrelezTM/YouTubeDLWhatsAppBOT)
+// -------------------------------------------------------------
+const VIDEO_CONFIG = {
+    name: 'YouTubeDLBOT',
+    filename: { mp3: 'youtubedl', mp4: 'youtubedl' }, // file base names
+    maxVideoSeconds: 600,     // WhatsApp hard-limits media around 16 min; send longer as document
+    downloadDir: path.join(__dirname, 'src', 'database'),
+    timezone: 'Asia/Jakarta'
+};
 let agentSessionCache = { token: '', sessionId: '', providerId: '', model: '' };
 
 function httpPostJson(urlStr, data, headers = {}) {
@@ -200,7 +212,6 @@ async function startBot() {
         await sendMessageSafe(from, {
             text: `🌐 *BROWSE MODE:* Processing \`${urlCandidate}\` (Delay: ${delaySec}s, Page:${isFullPage ? '100%' : (pMatch ? pMatch[1] + '%' : 'Default')})...`
         });
-
         const runScript = `cd '${currentSession.cwd}' && agentic-browser${inputCmd} 2>&1`;
         exec(runScript, async (err, stdout, stderr) => {
             const output = stdout || stderr || '';
@@ -225,6 +236,203 @@ async function startBot() {
                 }
             }
         });
+    };
+
+
+    // ---------------------------------------------------------
+    // VIDEO MODE (YouTube Downloader) — replica of
+    // https://github.com/DrelezTM/YouTubeDLWhatsAppBOT
+    // Uses ytdl-core when installed, otherwise falls back to yt-dlp.
+    // Commands: .video <url> | .audio <url> | .detail <url>
+    // ---------------------------------------------------------
+    let ytdlLib = null;
+    try { ytdlLib = require('ytdl-core'); } catch (e) { ytdlLib = null; }
+
+    const YT_URL_REGEX = /(https?:\/\/)?(www\.|m\.|music\.)?(youtube\.com|youtu\.be)\/\S+/i;
+
+    const extractUrl = (raw) => {
+        if (!raw) return null;
+        const match = raw.match(YT_URL_REGEX);
+        return match ? match[0] : null;
+    };
+
+    const isValidYouTubeUrl = (url) => {
+        if (!url) return false;
+        if (ytdlLib && typeof ytdlLib.validateURL === 'function') {
+            try { return ytdlLib.validateURL(url); } catch (e) { return false; }
+        }
+        return YT_URL_REGEX.test(url);
+    };
+
+    const getVideoInfo = (url) => new Promise((resolve, reject) => {
+        if (ytdlLib) {
+            ytdlLib.getInfo(url).then((info) => {
+                resolve({
+                    channel: {
+                        name: info.videoDetails.author.name,
+                        user: info.videoDetails.author.user,
+                        channelUrl: info.videoDetails.author.channel_url,
+                        userUrl: info.videoDetails.author.user_url,
+                        verified: info.videoDetails.author.verified,
+                        subscriber: info.videoDetails.author.subscriber_count
+                    },
+                    video: {
+                        title: info.videoDetails.title,
+                        description: info.videoDetails.description,
+                        lengthSeconds: parseInt(info.videoDetails.lengthSeconds || '0'),
+                        videoUrl: info.videoDetails.video_url,
+                        publishDate: info.videoDetails.publishDate,
+                        viewCount: info.videoDetails.viewCount
+                    }
+                });
+            }).catch(reject);
+            return;
+        }
+        exec(`yt-dlp -J --no-warnings "${url.replace(/"/g, '\\"')}"`, { maxBuffer: 1024 * 1024 * 20 }, (err, stdout) => {
+            if (err || !stdout) return reject(new Error('Could not fetch video info (install ytdl-core or yt-dlp).'));
+            try {
+                const d = JSON.parse(stdout);
+                resolve({
+                    channel: {
+                        name: d.uploader || d.channel || 'Unknown',
+                        user: d.channel_id || d.uploader_id || 'Unknown',
+                        channelUrl: d.channel_url || d.uploader_url || '',
+                        userUrl: d.uploader_url || '',
+                        verified: false,
+                        subscriber: d.channel_follower_count ? `${d.channel_follower_count} subscribers` : 'N/A'
+                    },
+                    video: {
+                        title: d.title,
+                        description: d.description,
+                        lengthSeconds: d.duration || 0,
+                        videoUrl: d.webpage_url || url,
+                        publishDate: d.upload_date ? `${d.upload_date.slice(0, 4)}-${d.upload_date.slice(4, 6)}-${d.upload_date.slice(6, 8)}` : 'N/A',
+                        viewCount: String(d.view_count || 0)
+                    }
+                });
+            } catch (e) { reject(e); }
+        });
+    });
+
+    const processVideoCommand = async (from, currentSession, subCmd, rawArgs) => {
+        const url = extractUrl(rawArgs);
+
+        if (subCmd === 'help' || (!url && !rawArgs)) {
+            await sendMessageSafe(from, {
+                text: `*${VIDEO_CONFIG.name}*\n\n` +
+                      `[🎥] : *.video <youtube-url>*\n` +
+                      `[🎧] : *.audio <youtube-url>*\n` +
+                      `[ℹ️] : *.detail <youtube-url>*\n\n` +
+                      `*Example :*\n.audio https://youtu.be/abcdefghij`
+            });
+            return;
+        }
+
+        if (!isValidYouTubeUrl(url)) {
+            await sendMessageSafe(from, { text: `*[❎]* Failed!, Invalid YouTube URL` });
+            return;
+        }
+
+        const timeStart = Date.now();
+        await sendMessageSafe(from, { text: `[⏳] Loading..` });
+
+        let data = null;
+        try {
+            data = await getVideoInfo(url);
+        } catch (err) {
+            await sendMessageSafe(from, { text: `*[❎]* Failed! ${err.message || ''}` });
+            return;
+        }
+
+        // .detail command -> just print metadata (replica of detailYouTube)
+        if (subCmd === 'detail') {
+            await sendMessageSafe(from, {
+                text: `*CHANNEL DETAILS*\n• Name : *${data.channel.name}*\n• User : *${data.channel.user}*\n• Verified : *${data.channel.verified}*\n• Channel : *${data.channel.channelUrl}*\n• Subscriber : *${data.channel.subscriber}*`
+            });
+            await sendMessageSafe(from, {
+                text: `*VIDEO DETAILS*\n• Title : *${data.video.title}*\n• Seconds : *${data.video.lengthSeconds}*\n• VideoURL : *${data.video.videoUrl}*\n• Publish : *${data.video.publishDate}*\n• Viewers : *${data.video.viewCount}*`
+            });
+            await sendMessageSafe(from, { text: `*[✅]* Successfully!` });
+            return;
+        }
+
+        const format = subCmd === 'audio' ? 'mp3' : 'mp4';
+        const filter = format === 'mp3' ? 'audioonly' : 'audioandvideo';
+        const safeTitle = (data.video.title || 'download').replace(/[^\w\s\-().]/g, '').slice(0, 60).trim().replace(/\s+/g, '_') || 'download';
+        const baseName = `${VIDEO_CONFIG.filename[format]}_${safeTitle}_${Date.now()}`;
+        const outPath = path.join(VIDEO_CONFIG.downloadDir, baseName);
+
+        try {
+            fs.mkdirSync(VIDEO_CONFIG.downloadDir, { recursive: true });
+        } catch (e) {}
+
+        const currentTaskId = Date.now();
+        const taskObj = { id: currentTaskId, name: `${baseName}.${format}`, progress: 50, statusMsg: 'Downloading...', process: null, wasKilled: false, mode: 'video' };
+        currentSession.tasks.push(taskObj);
+
+        let finalFile = null;
+        try {
+            if (ytdlLib) {
+                finalFile = `${outPath}.${format}`;
+                await new Promise((resolve, reject) => {
+                    const stream = ytdlLib(url, { filter, quality: format === 'mp3' ? 'highestaudio' : 'highest' })
+                        .pipe(fs.createWriteStream(finalFile));
+                    stream.on('finish', resolve);
+                    stream.on('error', reject);
+                    taskObj.process = { kill: () => { try { stream.destroy(); } catch (e) {} } };
+                });
+            } else {
+                const proc = exec(
+                    format === 'mp3'
+                        ? `yt-dlp -f "bestaudio/best" -x --audio-format mp3 --audio-quality 0 -o "${outPath}.%(ext)s" --no-playlist --no-warnings "${url.replace(/"/g, '\\"')}"`
+                        : `yt-dlp -f "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best" -o "${outPath}.%(ext)s" --no-playlist --no-warnings "${url.replace(/"/g, '\\"')}"`
+                );
+                taskObj.process = proc;
+                await new Promise((resolveP, rejectP) => {
+                    proc.on('close', (code) => code === 0 ? resolveP() : rejectP(new Error('yt-dlp failed (is yt-dlp/ffmpeg installed?).')));
+                    proc.on('error', rejectP);
+                });
+                const files = fs.readdirSync(VIDEO_CONFIG.downloadDir).filter(f => f.startsWith(baseName) && !f.endsWith('.part'));
+                if (!files.length) throw new Error('Downloaded file not found.');
+                finalFile = path.join(VIDEO_CONFIG.downloadDir, files[0]);
+            }
+        } catch (err) {
+            currentSession.tasks = currentSession.tasks.filter(t => t.id !== currentTaskId);
+            if (!taskObj.wasKilled) await sendMessageSafe(from, { text: `*[❎]* Failed! ${err.message || ''}` });
+            return;
+        }
+
+        currentSession.tasks = currentSession.tasks.filter(t => t.id !== currentTaskId);
+        if (taskObj.wasKilled) return;
+
+        const timestamp = (Date.now() - timeStart) / 1000;
+        const fileName = `${VIDEO_CONFIG.filename[format]}.${path.extname(finalFile).replace('.', '')}`;
+
+        try {
+            if (format === 'mp4' && data.video.lengthSeconds <= VIDEO_CONFIG.maxVideoSeconds) {
+                await sendMessageSafe(from, {
+                    video: { url: finalFile },
+                    mimetype: 'video/mp4',
+                    fileName,
+                    caption: `🎥 *${data.video.title}*`
+                });
+            } else {
+                await sendFileToUser(from, currentSession, finalFile);
+            }
+        } catch (sendErr) {
+            await sendMessageSafe(from, { text: `⚠️ *Upload failed:* ${sendErr.message}. Trying as document...` });
+            try { await sendFileToUser(from, currentSession, finalFile); } catch (e) {}
+        }
+
+        await sendMessageSafe(from, {
+            text: `• Title : *${data.video.title}*\n` +
+                  `• Channel : *${data.channel.user || data.channel.name}*\n` +
+                  `• View Count : *${data.video.viewCount}*\n` +
+                  `• TimeStamp : *${timestamp.toFixed(1)} seconds*`
+        });
+        await sendMessageSafe(from, { text: `*[✅]* Successfully!` });
+
+        try { fs.unlinkSync(finalFile); } catch (e) {}
     };
 
     if (!sock.authState.creds.registered && phoneNumber) {
@@ -301,7 +509,8 @@ async function startBot() {
                         providersList: [],
                         pendingProvider: null,
                         modelsList: [],
-                        pendingGetPath: null
+                        pendingGetPath: null,
+                        pendingVideoUrl: null
                     };
                 }
                 const currentSession = sessions[from];
@@ -311,6 +520,7 @@ async function startBot() {
                     currentSession.mode = 'normal';
                     currentSession.selectionStep = null;
                     currentSession.pendingGetPath = null;
+                    currentSession.pendingVideoUrl = null;
                     currentSession.tasks = [];
                     await sendMessageSafe(from, { text: `✅ *MODE TERMINATED & RESET TO NORMAL*` });
                     continue;
@@ -319,7 +529,17 @@ async function startBot() {
                 // 5. MEDIA HANDLING (STRICTLY ONLY WHEN IN GET MODE)
                 const isMedia = msgContent.imageMessage || msgContent.documentMessage || msgContent.videoMessage || msgContent.audioMessage || msgContent.stickerMessage;
                 if (isMedia) {
-                    if (currentSession.mode !== 'get') {
+                    // Allow captioned media to trigger VIDEO MODE commands (e.g. forwarded ".video <url>" caption)
+                    const mediaCaption = (msgContent.imageMessage?.caption || msgContent.videoMessage?.caption || msgContent.documentMessage?.caption || '').trim();
+                    const isVideoCmd = /^\.(video|audio|detail)(\s|$)/.test(mediaCaption);
+                    if (currentSession.mode !== 'get' && !isVideoCmd) {
+                        continue;
+                    }
+                    if (isVideoCmd && currentSession.mode !== 'get') {
+                        const subCmd = mediaCaption.slice(1).split(/\s+/)[0];
+                        const rawArgs = mediaCaption.slice(1 + subCmd.length).trim();
+                        currentSession.mode = 'video';
+                        await processVideoCommand(from, currentSession, subCmd, rawArgs);
                         continue;
                     }
 
@@ -396,6 +616,10 @@ async function startBot() {
                                    `• Format: \`.get <save_path>\` or type \`.get\`\n\n` +
                                    `🌐 *5. BROWSE MODE (Web Screenshot Controls)*\n` +
                                    `• Format: \`.brows <url> -p <pct> -d <delay>\`\n\n` +
+                                   `🎬 *6. VIDEO MODE (YouTube Downloader)*\n` +
+                                   `• Video: \`.video <youtube-url>\` (sends MP4)\n` +
+                                   `• Audio: \`.audio <youtube-url>\` (sends MP3)\n` +
+                                   `• Info: \`.detail <youtube-url>\` (channel & video metadata)\n\n` +
                                    `⚙️ *Task Control:*\n` +
                                    `• \`.pro\` - Check active background tasks\n` +
                                    `• \`.kill\` - Stop running processes\n` +
@@ -481,6 +705,25 @@ async function startBot() {
                         continue;
                     }
                     await processBrowsingCommand(from, currentSession, browsCmd);
+                    continue;
+                }
+
+                // VIDEO MODE COMMANDS (.video / .audio / .detail) — YouTube downloader
+                if (text === '.video' || text.startsWith('.video ') ||
+                    text === '.audio' || text.startsWith('.audio ') ||
+                    text === '.detail' || text.startsWith('.detail ')) {
+                    const subCmd = text.slice(1).split(/\s+/)[0];          // video | audio | detail
+                    const rawArgs = text.slice(1 + subCmd.length).trim();  // rest of the message
+                    currentSession.mode = 'video';
+                    if (!rawArgs) {
+                        currentSession.pendingVideoUrl = null;
+                        await sendMessageSafe(from, {
+                            text: `🎬 *VIDEO MODE ACTIVATED*\n\n` +
+                                  `👉 Send a YouTube link in your next message.`
+                        });
+                        continue;
+                    }
+                    await processVideoCommand(from, currentSession, subCmd, rawArgs);
                     continue;
                 }
 
@@ -586,6 +829,13 @@ async function startBot() {
 
                 if (currentSession.mode === 'brows') {
                     await processBrowsingCommand(from, currentSession, text);
+                    continue;
+                }
+
+                if (currentSession.mode === 'video') {
+                    const targetUrl = extractUrl(text) || currentSession.pendingVideoUrl;
+                    currentSession.pendingVideoUrl = null;
+                    await processVideoCommand(from, currentSession, 'video', targetUrl || '');
                     continue;
                 }
 
