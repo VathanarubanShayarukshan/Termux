@@ -9,6 +9,7 @@
     "axios": "^0.21.1",
     "fluent-ffmpeg": "^2.1.2",
     "image-q": "^4.0.0",
+    "pino": "^6.11.0",
     "streamifier": "^0.1.1"
   }
 }

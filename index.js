@@ -19,6 +19,7 @@ const pino = require('pino');
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
+const https = require('https');
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 const question = (text) => new Promise((resolve) => rl.question(text, resolve));
@@ -29,69 +30,59 @@ const AGENTIC_BASE_URL = process.env.AGENTIC_URL || 'http://127.0.0.1:8000';
 const AGENTIC_PASS = process.env.AGENTIC_PASSWORD || 'test-pass';
 let agentSessionCache = { token: '', sessionId: '', providerId: '', model: '' };
 
-function httpPostJson(urlStr, data, headers = {}) {
+function requestJson(urlStr, method, data, headers = {}) {
     return new Promise((resolve, reject) => {
         try {
             const u = new URL(urlStr);
-            const payload = JSON.stringify(data);
-            const req = http.request(u, {
-                method: 'POST',
+            const lib = u.protocol === 'https:' ? https : http;
+            const payload = data === undefined || data === null ? null : JSON.stringify(data);
+            const req = lib.request(u, {
+                method,
                 headers: {
-                    'Content-Type': 'application/json',
-                    'Content-Length': Buffer.byteLength(payload),
+                    ...(payload !== null ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } : {}),
                     ...headers
                 }
             }, (res) => {
                 let body = '';
                 res.on('data', chunk => body += chunk);
                 res.on('end', () => {
-                    try { resolve(JSON.parse(body)); } catch (e) { resolve({}); }
+                    let json = null;
+                    try { json = JSON.parse(body); } catch (e) {}
+                    resolve({ status: res.statusCode, json });
                 });
             });
             req.on('error', reject);
-            req.write(payload);
+            if (payload !== null) req.write(payload);
             req.end();
         } catch (e) { reject(e); }
     });
 }
 
-function httpGetJson(urlStr, headers = {}) {
-    return new Promise((resolve, reject) => {
-        try {
-            const u = new URL(urlStr);
-            const req = http.get(u, { headers }, (res) => {
-                let body = '';
-                res.on('data', chunk => body += chunk);
-                res.on('end', () => {
-                    try { resolve(JSON.parse(body)); } catch (e) { resolve({}); }
-                });
-            });
-            req.on('error', reject);
-        } catch (e) { reject(e); }
-    });
-}
+const httpPostJson = (urlStr, data, headers = {}) => requestJson(urlStr, 'POST', data, headers);
+const httpGetJson = (urlStr, headers = {}) => requestJson(urlStr, 'GET', null, headers);
 
 async function initAgentConfig() {
     try {
         if (!agentSessionCache.token) {
             const authRes = await httpPostJson(`${AGENTIC_BASE_URL}/api/auth/login`, { password: AGENTIC_PASS });
-            if (authRes && authRes.token) agentSessionCache.token = authRes.token;
+            if (authRes.status === 200 && authRes.json && authRes.json.token) agentSessionCache.token = authRes.json.token;
         }
         const authHeader = agentSessionCache.token ? { 'Authorization': `Bearer ${agentSessionCache.token}` } : {};
 
         if (!agentSessionCache.sessionId) {
             const sessRes = await httpPostJson(`${AGENTIC_BASE_URL}/api/sessions`, {}, authHeader);
-            if (sessRes && sessRes.id) agentSessionCache.sessionId = sessRes.id;
+            if (sessRes.status === 200 && sessRes.json && sessRes.json.id) agentSessionCache.sessionId = sessRes.json.id;
         }
 
         if (!agentSessionCache.providerId || !agentSessionCache.model) {
-            const providers = await httpGetJson(`${AGENTIC_BASE_URL}/api/providers`, authHeader);
-            if (Array.isArray(providers) && providers.length > 0) {
-                const activeP = providers.find(p => p.models && p.models.length > 0 && p.api_key_set) || providers[0];
-                if (activeP && activeP.models && activeP.models.length > 0) {
-                    agentSessionCache.providerId = activeP.id;
-                    agentSessionCache.model = activeP.models[0];
-                }
+            const provRes = await httpGetJson(`${AGENTIC_BASE_URL}/api/providers`, authHeader);
+            const providers = provRes.status === 200 && Array.isArray(provRes.json) ? provRes.json : [];
+            const activeP = providers.find(p => p.api_key_set && p.models && p.models.length > 0)
+                || providers.find(p => (p.base_url || '').startsWith('builtin://') && p.models && p.models.length > 0)
+                || providers.find(p => p.models && p.models.length > 0);
+            if (activeP) {
+                agentSessionCache.providerId = activeP.id;
+                agentSessionCache.model = activeP.models[0];
             }
         }
         return true;
@@ -486,17 +477,33 @@ async function startBot() {
 
                 if (text === '.model' || text === '.agent model' || text === '.agent new') {
                     currentSession.mode = 'agent';
-                    await initAgentConfig();
+                    const initOk = await initAgentConfig();
+                    if (!initOk) {
+                        await sendMessageSafe(from, { text: `❌ *Cannot reach JARVIS server* at \`${AGENTIC_BASE_URL}\`.\nStart it first, then try again.` });
+                        continue;
+                    }
 
                     const authHeader = agentSessionCache.token ? { 'Authorization': `Bearer ${agentSessionCache.token}` } : {};
 
                     if (text === '.agent new') {
                         const sessRes = await httpPostJson(`${AGENTIC_BASE_URL}/api/sessions`, {}, authHeader);
-                        if (sessRes && sessRes.id) currentSession.agentSessionId = sessRes.id;
+                        if (sessRes.status === 200 && sessRes.json && sessRes.json.id) currentSession.agentSessionId = sessRes.json.id;
                     }
 
-                    const providers = await httpGetJson(`${AGENTIC_BASE_URL}/api/providers`, authHeader);
-                    const validProviders = Array.isArray(providers) ? providers.filter(p => p.models && p.models.length > 0) : [];
+                    let providers = [];
+                    try {
+                        const provRes = await httpGetJson(`${AGENTIC_BASE_URL}/api/providers`, authHeader);
+                        if (provRes.status !== 200) {
+                            const detail = (provRes.json && provRes.json.detail) || `HTTP ${provRes.status}`;
+                            await sendMessageSafe(from, { text: `❌ *JARVIS error:* ${detail}\nCheck AGENTIC_PASSWORD / server login.` });
+                            continue;
+                        }
+                        providers = Array.isArray(provRes.json) ? provRes.json : [];
+                    } catch (e) {
+                        await sendMessageSafe(from, { text: `❌ *Cannot reach JARVIS server:* ${e.message}` });
+                        continue;
+                    }
+                    const validProviders = providers.filter(p => p.models && p.models.length > 0);
 
                     if (validProviders.length === 0) {
                         await sendMessageSafe(from, { text: `❌ No active providers available.` });
@@ -590,7 +597,11 @@ async function startBot() {
                 }
 
                 if (currentSession.mode === 'agent') {
-                    await initAgentConfig();
+                    const initOk = await initAgentConfig();
+                    if (!initOk) {
+                        await sendMessageSafe(from, { text: `❌ *Cannot reach JARVIS server* at \`${AGENTIC_BASE_URL}\`.\nStart it first, then try again.` });
+                        continue;
+                    }
                     const currentTaskId = Date.now();
                     const taskObj = { id: currentTaskId, name: text.slice(0, 25), progress: 10, statusMsg: 'Thinking...', req: null, wasKilled: false, mode: 'agent' };
                     currentSession.tasks.push(taskObj);
@@ -605,6 +616,7 @@ async function startBot() {
                         let sseBuffer = '';
                         try {
                             const u = new URL(`${AGENTIC_BASE_URL}/api/chat`);
+                            const lib = u.protocol === 'https:' ? https : http;
                             const payload = JSON.stringify({
                                 session_id: activeSessionId,
                                 message: text,
@@ -614,11 +626,21 @@ async function startBot() {
                             const authHeader = agentSessionCache.token ? { 'Authorization': `Bearer ${agentSessionCache.token}` } : {};
 
                             await new Promise((resolve, reject) => {
-                                const req = http.request(u, {
+                                const req = lib.request(u, {
                                     method: 'POST',
-                                    timeout: 120000,
                                     headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload), ...authHeader }
                                 }, (res) => {
+                                    if (res.statusCode !== 200) {
+                                        let errBody = '';
+                                        res.on('data', chunk => errBody += chunk);
+                                        res.on('end', () => {
+                                            let detail = `HTTP ${res.statusCode}`;
+                                            try { detail = JSON.parse(errBody).detail || detail; } catch (e) {}
+                                            errorMessage = detail;
+                                            resolve();
+                                        });
+                                        return;
+                                    }
                                     res.on('data', (chunk) => {
                                         const liveTask = currentSession.tasks.find(t => t.id === currentTaskId);
                                         if (!liveTask || liveTask.wasKilled) { res.destroy(); return; }
@@ -629,19 +651,27 @@ async function startBot() {
 
                                         for (const line of lines) {
                                             const trimmedLine = line.trim();
-                                            if (trimmedLine.startsWith('data: ')) {
-                                                const jsonData = trimmedLine.slice(6).trim();
-                                                if (jsonData === '[DONE]') continue;
-                                                try {
-                                                    const parsed = JSON.parse(jsonData);
-                                                    if (parsed.text) finalResponseText += parsed.text;
-                                                    else if (parsed.content) finalResponseText += parsed.content;
-                                                    else if (parsed.delta) finalResponseText += parsed.delta;
-                                                    if (parsed.status) liveTask.statusMsg = parsed.status;
-                                                    if (parsed.progress) liveTask.progress = parsed.progress;
-                                                } catch (e) {
-                                                    finalResponseText += jsonData;
-                                                }
+                                            if (!trimmedLine.startsWith('data: ')) continue;
+                                            const jsonData = trimmedLine.slice(6).trim();
+                                            if (jsonData === '[DONE]') continue;
+                                            let parsed;
+                                            try { parsed = JSON.parse(jsonData); } catch (e) { continue; }
+                                            if (parsed.type === 'text') {
+                                                finalResponseText += parsed.text || '';
+                                            } else if (parsed.type === 'done') {
+                                                if (parsed.content) finalResponseText = parsed.content;
+                                                liveTask.progress = 100;
+                                                liveTask.statusMsg = 'Done';
+                                            } else if (parsed.type === 'error') {
+                                                errorMessage = parsed.message || 'Unknown agent error';
+                                            } else if (parsed.type === 'status') {
+                                                liveTask.statusMsg = parsed.message || 'Thinking...';
+                                            } else if (parsed.type === 'tool_call') {
+                                                liveTask.statusMsg = `Running: ${parsed.name}`;
+                                                liveTask.progress = 50;
+                                            } else if (parsed.type === 'tool_result') {
+                                                liveTask.statusMsg = `Result: ${parsed.name}`;
+                                                liveTask.progress = 80;
                                             }
                                         }
                                     });
@@ -649,6 +679,7 @@ async function startBot() {
                                     res.on('error', (e) => reject(e));
                                 });
                                 req.on('error', (e) => reject(e));
+                                req.setTimeout(300000, () => req.destroy(new Error('JARVIS request timed out (300s)')));
                                 taskObj.req = req;
                                 req.write(payload);
                                 req.end();
@@ -658,10 +689,15 @@ async function startBot() {
                         } finally {
                             currentSession.tasks = currentSession.tasks.filter(t => t.id !== currentTaskId);
                             if (taskObj.wasKilled) return;
-                            if (finalResponseText.trim()) {
-                                await sendMessageSafe(from, { text: `🤖 *JARVIS Agent Output:*\n\n${finalResponseText.trim()}` });
-                            } else if (errorMessage) {
-                                await sendMessageSafe(from, { text: `❌ *Agent Request Failed:* ${errorMessage}` });
+                            if (errorMessage) {
+                                await sendMessageSafe(from, { text: `❌ *Agent Error:* ${errorMessage}` });
+                            } else if (finalResponseText.trim()) {
+                                const out = finalResponseText.trim();
+                                const chunks = [];
+                                for (let i = 0; i < out.length; i += 3900) chunks.push(out.slice(i, i + 3900));
+                                for (let i = 0; i < chunks.length; i++) {
+                                    await sendMessageSafe(from, { text: (i === 0 ? '🤖 *JARVIS Agent Output:*\n\n' : '') + chunks[i] });
+                                }
                             } else {
                                 await sendMessageSafe(from, { text: `⚠️ No response received from agent.` });
                             }
